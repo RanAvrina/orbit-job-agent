@@ -24,8 +24,15 @@ const SB_KEY=process.env.SUPABASE_SECRET_KEY||'';
 const USE_SB=!!(SB_URL&&SB_KEY);
 const SERPAPI_KEY=process.env.SERPAPI_KEY||'';
 const SERP_MIN_HOURS=Math.max(6,Number(process.env.SERP_INTERVAL_HOURS||6));
-const SERP_QUERIES=['junior ERP CRM information systems Israel','junior PMO project coordinator Tel Aviv Israel','junior data analyst BI Beer Sheva Israel','מיישם מערכות מידע גוניור תל אביב באר שבע'];
-const GOOGLE_SEARCH_QUERIES=['site:linkedin.com/jobs/view/ junior ERP Israel','site:alljobs.co.il מיישם מערכות מידע','site:jobmaster.co.il PMO junior','site:drushim.co.il אנליסט מערכות מידע'];
+// Google Jobs via SerpApi rejects gl=il; use supported indexed Google search instead.
+// One query every 12 hours = ~60 searches per 30 days, leaving quota for manual checks.
+const GOOGLE_SEARCH_QUERIES=[
+ 'site:linkedin.com/jobs/view/ ("Tel Aviv" OR "Beer Sheva") ("junior" OR "entry level") ("data analyst" OR "ERP" OR "PMO")',
+ 'site:alljobs.co.il ("באר שבע" OR "תל אביב") ("מערכות מידע" OR "מיישם" OR "אנליסט")',
+ 'site:jobmaster.co.il ("באר שבע" OR "תל אביב") ("PMO" OR "ERP" OR "דאטה")',
+ 'site:drushim.co.il ("באר שבע" OR "תל אביב") ("מערכות מידע" OR "אנליסט" OR "מטמיע")',
+ '("junior data analyst" OR "junior ERP" OR "PMO") ("Tel Aviv" OR "Beer Sheva") jobs Israel'
+];
 
 if ((SB_URL&&!SB_KEY)||(!SB_URL&&SB_KEY)) throw Error('Set both SUPABASE_URL and SUPABASE_SECRET_KEY');
 if (USE_SB && !/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(SB_URL)) throw Error('Invalid SUPABASE_URL');
@@ -79,82 +86,58 @@ function evaluate(j){
 }
 async function persist(){if(USE_SB)return;await fs.mkdir(path.dirname(STORE),{recursive:true});const temp=STORE+'.tmp';await fs.writeFile(temp,JSON.stringify(db,null,2),{mode:0o600});await fs.rename(temp,STORE)}
 async function getJSON(url){const res=await fetch(url,{signal:AbortSignal.timeout(FETCH_TIMEOUT),headers:{'User-Agent':'OrbitJobAgent/5.0'}});if(!res.ok)throw Error(`HTTP ${res.status}`);return res.json()}
-// SerpApi requests are throttled independently of the 30-minute board scans.
-// 6h Google Jobs + 12h indexed Google Search ~= 180 queries per 30 days.
-// The scan_logs table is the durable throttle across Render restarts.
-const serpLastRun={jobs:0,search:0};
-async function dueSerp(kind,hours){
-  if(!SERPAPI_KEY)return false;
-  const minMs=Math.max(hours,6)*3600000;
-  let last=serpLastRun[kind];
-  if(USE_SB){
-    const source=kind==='jobs'?'SerpApiGoogleJobs':'SerpApiGoogleSearch';
-    const rows=await sb('scan_logs',{query:`?select=created_at&source=eq.${source}&order=created_at.desc&limit=1`});
-    last=Math.max(last,rows[0]?.created_at?new Date(rows[0].created_at).getTime():0);
-  }
-  return Date.now()-last>=minMs;
+// Durable rate limit across restarts, including unsuccessful searches.
+const serpLastRun={search:0};
+async function dueSerp(){
+ if(!SERPAPI_KEY)return false;
+ let last=serpLastRun.search;
+ if(USE_SB){
+  const rows=await sb('scan_logs',{query:'?select=created_at&source=eq.SerpApiGoogleSearch&order=created_at.desc&limit=1'});
+  last=Math.max(last,rows[0]?.created_at?new Date(rows[0].created_at).getTime():0);
+ }
+ return Date.now()-last>=Math.max(12,SERP_MIN_HOURS)*3600000;
 }
 async function serpRequest(params){
  const url=new URL('https://serpapi.com/search.json');
  Object.entries(params).forEach(([key,value])=>url.searchParams.set(key,String(value)));
  url.searchParams.set('api_key',SERPAPI_KEY);
- // Never print the URL or request headers: the URL contains a secret.
+ // Never log request URL: it contains the secret.
  let r;
- try {r=await fetch(url,{signal:AbortSignal.timeout(45000)});}
- catch(e){throw Error(e.name==='TimeoutError'||e.name==='AbortError'?'SerpApi timeout after 45 seconds':`SerpApi network error: ${e.message}`);}
- const raw=await r.text();let data={};
- try{data=JSON.parse(raw)}catch{}
- if(!r.ok || data.error){
-   const detail=String(data.error||data.message||`HTTP ${r.status}`).slice(0,250).replaceAll(SERPAPI_KEY,'[redacted]');
-   throw Error(`SerpApi HTTP ${r.status}: ${detail}`);
- }
+ try{r=await fetch(url,{signal:AbortSignal.timeout(25000)});}
+ catch(e){throw Error(`SerpApi request failed: ${e.name==='TimeoutError'||e.name==='AbortError'?'timeout after 25 seconds':e.message}`);}
+ const raw=await r.text();let data={};try{data=JSON.parse(raw)}catch{}
+ if(!r.ok||data.error){const detail=String(data.error||data.message||`HTTP ${r.status}`).slice(0,240).replaceAll(SERPAPI_KEY,'[redacted]');throw Error(`SerpApi HTTP ${r.status}: ${detail}`);}
  return data;
 }
-async function serpJobs(){
-  const slot=Math.floor(Date.now()/(6*3600000))%SERP_QUERIES.length;
-  const data=await serpRequest({engine:'google_jobs',q:SERP_QUERIES[slot],hl:'en',gl:'il'});
-  return (data.jobs_results||[]).map(x=>({
-    id:`serpjob:${x.job_id||crypto.createHash('sha256').update(String(x.title)+String(x.company_name)+String(x.location)).digest('hex')}`,
-    title:clean(x.title),company:clean(x.company_name),location:clean(x.location),
-    description:clean(x.description,3000),
-    url:(x.apply_options||[]).map(a=>a.link).find(u=>/^https:\/\//.test(u||''))||x.share_link||'',
-    source:'Google Jobs',publishedAt:null
-  }));
-}
 async function serpIndexed(){
-  const slot=Math.floor(Date.now()/(12*3600000))%GOOGLE_SEARCH_QUERIES.length;
-  const data=await serpRequest({engine:'google',q:GOOGLE_SEARCH_QUERIES[slot],hl:'he',gl:'il',num:'10'});
-  return (data.organic_results||[]).filter(x=>/^https:\/\//.test(x.link||'')).map(x=>({
-    id:`indexed:${crypto.createHash('sha256').update(x.link).digest('hex')}`,
-    title:clean(x.title),company:clean(x.source||new URL(x.link).hostname),
-    location:clean(x.snippet),description:clean(x.snippet),url:x.link,
-    source:'Google indexed listings',publishedAt:null
-  }));
+ const slot=Math.floor(Date.now()/(12*3600000))%GOOGLE_SEARCH_QUERIES.length;
+ const data=await serpRequest({engine:'google',q:GOOGLE_SEARCH_QUERIES[slot],hl:'he',gl:'il',google_domain:'google.co.il',num:'10'});
+ return (data.organic_results||[]).filter(x=>/^https:\/\//.test(x.link||'')).map(x=>({
+  id:`indexed:${crypto.createHash('sha256').update(x.link).digest('hex')}`,
+  title:clean(x.title),company:clean(x.source||new URL(x.link).hostname),
+  // Google snippets are not verified job locations; use only explicit geographic mentions.
+  location:clean(x.snippet),description:clean(x.snippet),url:x.link,
+  source:'Google indexed listings',publishedAt:null
+ }));
 }
 async function sourceJobs(){const tasks=[]; if(process.env.INCLUDE_ARBEITNOW==='true')tasks.push({name:'Arbeitnow',run:async()=>{const d=await getJSON('https://www.arbeitnow.com/api/job-board-api');return(d.data||[]).map(x=>({id:`arbeitnow:${x.slug||x.url}`,title:clean(x.title),company:clean(x.company_name),location:clean(x.location),description:clean(x.description),url:x.url,source:'Arbeitnow',publishedAt:x.created_at?new Date(x.created_at*1000).toISOString():null}))}});
 for(const board of BOARDS)tasks.push({name:`Greenhouse/${board}`,run:async()=>{const d=await getJSON(`https://boards-api.greenhouse.io/v1/boards/${board}/jobs?content=true`);return(d.jobs||[]).map(x=>({id:`greenhouse:${board}:${x.id}`,title:clean(x.title),company:board,location:clean(x.location?.name),description:clean(x.content),url:x.absolute_url,source:'Greenhouse',publishedAt:x.first_published||null}))}});
 for(const site of LEVER)tasks.push({name:`Lever/${site}`,run:async()=>{const d=await getJSON(`https://api.lever.co/v0/postings/${site}?mode=json`);return(d||[]).map(x=>({id:`lever:${site}:${x.id}`,title:clean(x.text),company:site,location:clean(x.categories?.location||x.workplaceType),description:clean(x.descriptionPlain||x.description),url:x.hostedUrl,source:'Lever',publishedAt:x.createdAt?new Date(x.createdAt).toISOString():null}))}});
 for(const board of ASHBY)tasks.push({name:`Ashby/${board}`,run:async()=>{const d=await getJSON(`https://api.ashbyhq.com/posting-api/job-board/${board}?includeCompensation=false`);return(d.jobs||[]).filter(x=>x.isListed!==false).map(x=>({id:`ashby:${board}:${x.id||x.jobUrl}`,title:clean(x.title),company:board,location:clean(x.location||x.address?.postalAddress?.addressLocality),description:clean(x.descriptionPlain||x.descriptionHtml||x.description),url:x.jobUrl||x.applyUrl,source:'Ashby',publishedAt:x.publishedAt||null}))}});
 if(SERPAPI_KEY){
-  // If quota metadata cannot be read, skip rather than risk extra paid calls.
-  try{
-    if(await dueSerp('jobs',SERP_MIN_HOURS))tasks.push({name:'SerpApiGoogleJobs',run:async()=>{
-      // Log every attempt, including failures, to avoid a rapid retry loop.
-      serpLastRun.jobs=Date.now();
-      try{const results=await serpJobs();if(USE_SB)await logScan('SerpApiGoogleJobs',results.length,'success',null);return results;}
-      catch(e){if(USE_SB)await logScan('SerpApiGoogleJobs',0,'error',e.message);throw e;}
-    }});
-    if(await dueSerp('search',Math.max(12,SERP_MIN_HOURS*2)))tasks.push({name:'SerpApiGoogleSearch',run:async()=>{
-      serpLastRun.search=Date.now();
-      try{const results=await serpIndexed();if(USE_SB)await logScan('SerpApiGoogleSearch',results.length,'success',null);return results;}
-      catch(e){if(USE_SB)await logScan('SerpApiGoogleSearch',0,'error',e.message);throw e;}
-    }});
-  }catch(e){console.error('SerpApi throttle check:',e.message)}
+ try{
+  if(await dueSerp())tasks.push({name:'SerpApiGoogleSearch',run:async()=>{
+   serpLastRun.search=Date.now();
+   try{const results=await serpIndexed();if(USE_SB)await logScan('SerpApiGoogleSearch',results.length,'success',null);return results;}
+   catch(e){if(USE_SB)await logScan('SerpApiGoogleSearch',0,'error',e.message);throw e;}
+  }});
+ }catch(e){console.error('SerpApi throttle check:',e.message)}
 }
+
 const outcomes=await Promise.allSettled(tasks.map(t=>t.run()));let jobs=[],errors=[];outcomes.forEach((r,i)=>{if(r.status==='fulfilled')jobs.push(...r.value);else errors.push(`${tasks[i].name}: ${r.reason.message}`)});return {jobs,errors,sources:tasks.length};}
-async function scan(){if(running)return {busy:true};running=true;try{const {jobs,errors,sources}=await sourceJobs();const eligibleCount=jobs.filter(j=>/^https:\/\//i.test(j.url||'')&&evaluate(j).eligible).length;console.log('ORBIT SCAN',JSON.stringify({fetched:jobs.length,eligible:eligibleCount,rejected:jobs.length-eligibleCount,sources,errors}));let added=0,updated=0,skipped=0;const existing=new Map(db.jobs.map(j=>[j.id,j]));const now=new Date().toISOString();for(const j of jobs){if(!/^https:\/\//i.test(j.url||'')){skipped++;continue}const match=evaluate(j);if(!match.eligible){skipped++;continue}const old=existing.get(j.id);const item={...j,score:match.score,reason:match.reason,firstSeen:old?.firstSeen||now,lastSeen:now};if(old){Object.assign(old,item);updated++}else{db.jobs.push(item);existing.set(j.id,item);added++}}db.jobs=db.jobs.filter(j=>Date.now()-new Date(j.lastSeen).getTime()<MAX_AGE_DAYS*86400000).sort((a,b)=>b.score-a.score||b.firstSeen.localeCompare(a.firstSeen)).slice(0,MAX_JOBS);if(USE_SB){await saveJobsSupabase(db.jobs);await logScan('all',jobs.length,errors.length?'partial':'success',errors.join('; ')||null)}db.lastScan=now;db.lastError=errors.join('; ')||null;db.scans++;await persist();return {added,updated,skipped,checked:jobs.length,eligible:eligibleCount,sources,errors}}catch(e){db.lastError=e.message;try{if(USE_SB)await logScan('all',0,'error',e.message);else await persist()}catch(logErr){console.error('Scan log:',logErr.message)}return {error:e.message}}finally{running=false}}
+async function scan(){if(running)return {busy:true};running=true;try{const {jobs,errors,sources}=await sourceJobs();const eligibleCount=jobs.filter(j=>/^https:\/\//i.test(j.url||'')&&evaluate(j).eligible).length;const rejectedReasons={};for(const j of jobs){const e=evaluate(j);if(!e.eligible)rejectedReasons[e.reason]=(rejectedReasons[e.reason]||0)+1;}console.log('ORBIT SCAN',JSON.stringify({fetched:jobs.length,eligible:eligibleCount,rejected:jobs.length-eligibleCount,sources,errors,rejectedReasons}));let added=0,updated=0,skipped=0;const existing=new Map(db.jobs.map(j=>[j.id,j]));const now=new Date().toISOString();for(const j of jobs){if(!/^https:\/\//i.test(j.url||'')){skipped++;continue}const match=evaluate(j);if(!match.eligible){skipped++;continue}const old=existing.get(j.id);const item={...j,score:match.score,reason:match.reason,firstSeen:old?.firstSeen||now,lastSeen:now};if(old){Object.assign(old,item);updated++}else{db.jobs.push(item);existing.set(j.id,item);added++}}db.jobs=db.jobs.filter(j=>Date.now()-new Date(j.lastSeen).getTime()<MAX_AGE_DAYS*86400000).sort((a,b)=>b.score-a.score||b.firstSeen.localeCompare(a.firstSeen)).slice(0,MAX_JOBS);if(USE_SB){await saveJobsSupabase(db.jobs);await logScan('all',jobs.length,errors.length?'partial':'success',errors.join('; ')||null)}db.lastScan=now;db.lastError=errors.join('; ')||null;db.scans++;await persist();return {added,updated,skipped,checked:jobs.length,eligible:eligibleCount,sources,errors}}catch(e){db.lastError=e.message;try{if(USE_SB)await logScan('all',0,'error',e.message);else await persist()}catch(logErr){console.error('Scan log:',logErr.message)}return {error:e.message}}finally{running=false}}
 const json=(res,status,obj)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(obj))};
 const authorized=req=>{const supplied=req.headers.authorization?.replace(/^Bearer /,'')||'';if(!TOKEN||!supplied)return false;const a=Buffer.from(TOKEN),b=Buffer.from(supplied);return a.length===b.length&&crypto.timingSafeEqual(a,b)};
-async function handler(req,res){try{secureHeaders(res);if(rateLimited(req))return json(res,429,{error:'יותר מדי בקשות'});const u=new URL(req.url,'http://localhost');if(u.pathname.startsWith('/api/')&&!authorized(req))return json(res,401,{error:'נדרש מפתח גישה'});if(u.pathname==='/api/status'&&req.method==='GET')return json(res,200,{lastScan:db.lastScan,lastError:db.lastError,total:db.jobs.length,scans:db.scans,scanRunning:running,scanEnabled:!!TOKEN,greenhouseBoards:BOARDS.length,leverSites:LEVER.length,ashbyBoards:ASHBY.length,sources:[...(process.env.INCLUDE_ARBEITNOW==='true'?['Arbeitnow']:[]),...(BOARDS.length?['Greenhouse']:[]),...(LEVER.length?['Lever']:[]),...(ASHBY.length?['Ashby']:[])],serpApiConfigured:!!SERPAPI_KEY,serpIntervalHours:Math.max(6,SERP_MIN_HOURS),autoApplyEnabled:APPLY_ENABLED,security:{privateApi:true,automaticSubmission:false}});if(u.pathname==='/api/jobs'&&req.method==='GET')return json(res,200,db.jobs.map(({description,...j})=>({...j,description:description.slice(0,320)})));if(u.pathname==='/api/applications'&&req.method==='GET')return json(res,200,db.applications);if(u.pathname==='/api/scan'&&req.method==='POST')return authorized(req)?json(res,200,await scan()):json(res,401,{error:'לא מורשה'});if(u.pathname==='/api/applications'&&req.method==='POST'){if(!authorized(req))return json(res,401,{error:'לא מורשה'});let body='';for await(const c of req){body+=c;if(body.length>10000)return json(res,413,{error:'בקשה גדולה מדי'})}let x;try{x=JSON.parse(body)}catch{return json(res,400,{error:'JSON לא תקין'})}if(!db.jobs.some(j=>j.id===x.jobId)||!['saved','applied','interview','rejected'].includes(x.status))return json(res,400,{error:'נתונים לא תקינים'});db.applications=db.applications.filter(a=>a.jobId!==x.jobId);db.applications.push({jobId:x.jobId,status:x.status,updatedAt:new Date().toISOString(),mode:'manual'});if(USE_SB)await saveApplicationSupabase(x);else await persist();return json(res,200,{ok:true})}if(u.pathname!=='/'&&u.pathname!=='/index.html')return json(res,404,{error:'לא נמצא'});const html=await fs.readFile(path.join(dir,'index.html'));res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;",'X-Content-Type-Options':'nosniff'});res.end(html)}catch(e){console.error(e);if(!res.headersSent)json(res,500,{error:'שגיאת שרת'})}}
+async function handler(req,res){try{secureHeaders(res);if(rateLimited(req))return json(res,429,{error:'יותר מדי בקשות'});const u=new URL(req.url,'http://localhost');if(u.pathname.startsWith('/api/')&&!authorized(req))return json(res,401,{error:'נדרש מפתח גישה'});if(u.pathname==='/api/status'&&req.method==='GET')return json(res,200,{lastScan:db.lastScan,lastError:db.lastError,total:db.jobs.length,scans:db.scans,scanRunning:running,scanEnabled:!!TOKEN,greenhouseBoards:BOARDS.length,leverSites:LEVER.length,ashbyBoards:ASHBY.length,sources:[...(process.env.INCLUDE_ARBEITNOW==='true'?['Arbeitnow']:[]),...(BOARDS.length?['Greenhouse']:[]),...(LEVER.length?['Lever']:[]),...(ASHBY.length?['Ashby']:[])],serpApiConfigured:!!SERPAPI_KEY,serpIntervalHours:Math.max(12,SERP_MIN_HOURS),autoApplyEnabled:APPLY_ENABLED,security:{privateApi:true,automaticSubmission:false}});if(u.pathname==='/api/jobs'&&req.method==='GET')return json(res,200,db.jobs.map(({description,...j})=>({...j,description:description.slice(0,320)})));if(u.pathname==='/api/applications'&&req.method==='GET')return json(res,200,db.applications);if(u.pathname==='/api/scan'&&req.method==='POST')return authorized(req)?json(res,200,await scan()):json(res,401,{error:'לא מורשה'});if(u.pathname==='/api/applications'&&req.method==='POST'){if(!authorized(req))return json(res,401,{error:'לא מורשה'});let body='';for await(const c of req){body+=c;if(body.length>10000)return json(res,413,{error:'בקשה גדולה מדי'})}let x;try{x=JSON.parse(body)}catch{return json(res,400,{error:'JSON לא תקין'})}if(!db.jobs.some(j=>j.id===x.jobId)||!['saved','applied','interview','rejected'].includes(x.status))return json(res,400,{error:'נתונים לא תקינים'});db.applications=db.applications.filter(a=>a.jobId!==x.jobId);db.applications.push({jobId:x.jobId,status:x.status,updatedAt:new Date().toISOString(),mode:'manual'});if(USE_SB)await saveApplicationSupabase(x);else await persist();return json(res,200,{ok:true})}if(u.pathname!=='/'&&u.pathname!=='/index.html')return json(res,404,{error:'לא נמצא'});const html=await fs.readFile(path.join(dir,'index.html'));res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;",'X-Content-Type-Options':'nosniff'});res.end(html)}catch(e){console.error(e);if(!res.headersSent)json(res,500,{error:'שגיאת שרת'})}}
 if(process.env.NODE_ENV!=='test'){http.createServer(handler).listen(PORT,()=>console.log(`Orbit http://localhost:${PORT}`));if(TOKEN){const begin=async()=>{if(USE_SB){try{await loadSupabase()}catch(e){console.error('Supabase initialization failed:',e.message);return}}await scan();setInterval(scan,INTERVAL)};begin()}}
 export {evaluate,scan,handler,authorized};
