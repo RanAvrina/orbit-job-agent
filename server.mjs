@@ -23,7 +23,7 @@ const SB_URL=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
 const SB_KEY=process.env.SUPABASE_SECRET_KEY||'';
 const USE_SB=!!(SB_URL&&SB_KEY);
 const SERPAPI_KEY=process.env.SERPAPI_KEY||'';
-const SERP_MIN_HOURS=Number(process.env.SERP_INTERVAL_HOURS||6);
+const SERP_MIN_HOURS=Math.max(6,Number(process.env.SERP_INTERVAL_HOURS||6));
 const SERP_QUERIES=['junior ERP CRM information systems Israel','junior PMO project coordinator Tel Aviv Israel','junior data analyst BI Beer Sheva Israel','מיישם מערכות מידע גוניור תל אביב באר שבע'];
 const GOOGLE_SEARCH_QUERIES=['site:linkedin.com/jobs/view/ junior ERP Israel','site:alljobs.co.il מיישם מערכות מידע','site:jobmaster.co.il PMO junior','site:drushim.co.il אנליסט מערכות מידע'];
 
@@ -59,15 +59,24 @@ const FETCH_TIMEOUT=12000;
 let db={jobs:[],applications:[],lastScan:null,lastError:null,scans:0};
 if(!USE_SB){try{db={...db,...JSON.parse(await fs.readFile(STORE,'utf8'))}}catch(e){if(e.code!=='ENOENT')console.error('Data load:',e.message)}}
 let running=false;
-const clean=(s,max=1800)=>String(s||'').replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/\s+/g,' ').trim().slice(0,max);
+const clean=(s,max=1800)=>String(s||'').replace(/<[^>]*>/g,' ').replace(/&(?:amp;)?lt;/gi,'<').replace(/&(?:amp;)?gt;/gi,'>').replace(/&(?:amp;)?nbsp;/gi,' ').replace(/&amp;/gi,'&').replace(/<[^>]*>/g,' ').replace(/&#(\d+);/g,(_,n)=>String.fromCodePoint(Math.min(Number(n),0x10ffff))).replace(/\s+/g,' ').trim().slice(0,max);
 const role=/(project manager|project coordinator|project analyst|project control|\bpmo\b|program coordinator|implementation|information systems|business analyst|systems analyst|data analyst|bi analyst|erp|crm|priority|salesforce|monday\.com|automation specialist|ai agent|מנהל.{0,4}פרויקט|ניהול פרויקטים|רכז.{0,4}פרויקט|מערכות מידע|מיישמ|מטמיע|ניתוח מערכות|אנליסט|אוטומציה)/i;
 const junior=/(junior|entry[ -]?level|graduate|associate|intern|0[–-]2|0[–-]3|ללא ניסיון|ג׳וניור|ג'וניור|מתחיל)/i;
-const senior=/(senior|principal|director|head of|staff engineer|team lead|ראש צוות|מנהל מחלקה|סמנכ)/i;
+const senior=/(senior|principal|director|head of|staff engineer|team lead|enterprise account manager|account executive|ראש צוות|מנהל מחלקה|סמנכ)/i;
 const place=/(tel[ -]?aviv|תל אביב|ramat gan|רמת גן|be.?er sheva|beer sheva|באר שבע|ashdod|אשדוד|ashkelon|אשקלון|omer|עומר|lehavim|להבים|kiryat gat|קריית גת|קרית גת|netivot|נתיבות|ofakim|אופקים|sderot|שדרות|dimona|דימונה|southern district|south district|מחוז הדרום)/i;
 const remote=/(remote|work from anywhere|עבודה מהבית|מרחוק)/i;
 const israel=/(israel|ישראל)/i;
 const countryMismatch=/(germany|deutschland|united states|usa|united kingdom|uk|poland|france|spain|portugal|canada|australia|india|berlin|london|new york|warsaw)/i;
-function evaluate(j){const title=clean(j.title,300),body=clean(j.description,3000),loc=clean(j.location,200);const titleHit=role.test(title),bodyHit=role.test(body),seniorTitle=senior.test(title);const locationHit=place.test(loc);const locationAllowed=locationHit || (remote.test(loc)&&israel.test(loc)&&!countryMismatch.test(loc));const eligible=(titleHit||bodyHit)&&locationAllowed&&!seniorTitle;let score=15+(titleHit?42:bodyHit?12:0)+(junior.test(title)?20:junior.test(body)?8:0)+(locationHit?10:5)+(/sql|javascript|node\.js|typescript|priority|erp|crm|מערכות מידע/i.test(body)?8:0)-(seniorTitle?60:0);return {eligible,score:Math.max(0,Math.min(99,score)),reason:seniorTitle?'תפקיד בכיר':!locationAllowed?'מיקום לא מתאים':!titleHit?'התאמה לפי תיאור בלבד':'התאמה לפי תפקיד ומיקום'};}
+function evaluate(j){
+ const title=clean(j.title,300),body=clean(j.description,3000),loc=clean(j.location,200);
+ const titleHit=role.test(title),seniorTitle=senior.test(title);
+ const locationHit=place.test(loc);
+ const locationAllowed=locationHit || (remote.test(loc)&&israel.test(loc)&&!countryMismatch.test(loc));
+ const experience=/\b(?:[4-9]|1[0-9])\+?\s*(?:years|yrs)\b|(?:לפחות\s*)?[4-9]\s*שנות\s*ניסיון/i.test(body);
+ const eligible=titleHit&&locationAllowed&&!seniorTitle&&!experience;
+ let score=20+(titleHit?35:0)+(junior.test(title)?25:junior.test(body)?8:0)+(locationHit?10:5)+(/sql|javascript|node\.js|typescript|priority|erp|crm|מערכות מידע/i.test(body)?8:0);
+ return {eligible,score:Math.max(0,Math.min(99,score)),reason:seniorTitle?'תפקיד בכיר':!locationAllowed?'מיקום לא מתאים':!titleHit?'שם התפקיד אינו מתאים':experience?'נדרש ניסיון רב':'התאמה לפי תפקיד ומיקום'};
+}
 async function persist(){if(USE_SB)return;await fs.mkdir(path.dirname(STORE),{recursive:true});const temp=STORE+'.tmp';await fs.writeFile(temp,JSON.stringify(db,null,2),{mode:0o600});await fs.rename(temp,STORE)}
 async function getJSON(url){const res=await fetch(url,{signal:AbortSignal.timeout(FETCH_TIMEOUT),headers:{'User-Agent':'OrbitJobAgent/5.0'}});if(!res.ok)throw Error(`HTTP ${res.status}`);return res.json()}
 // SerpApi requests are throttled independently of the 30-minute board scans.
@@ -86,19 +95,24 @@ async function dueSerp(kind,hours){
   return Date.now()-last>=minMs;
 }
 async function serpRequest(params){
-  const url=new URL('https://serpapi.com/search.json');
-  Object.entries(params).forEach(([key,value])=>url.searchParams.set(key,value));
-  url.searchParams.set('api_key',SERPAPI_KEY);
-  // Do not log the URL: it contains the API key.
-  const r=await fetch(url,{signal:AbortSignal.timeout(20000)});
-  if(!r.ok)throw Error(`SerpApi HTTP ${r.status}`);
-  const data=await r.json();
-  if(data.error)throw Error(`SerpApi: ${String(data.error).slice(0,180)}`);
-  return data;
+ const url=new URL('https://serpapi.com/search.json');
+ Object.entries(params).forEach(([key,value])=>url.searchParams.set(key,String(value)));
+ url.searchParams.set('api_key',SERPAPI_KEY);
+ // Never print the URL or request headers: the URL contains a secret.
+ let r;
+ try {r=await fetch(url,{signal:AbortSignal.timeout(45000)});}
+ catch(e){throw Error(e.name==='TimeoutError'||e.name==='AbortError'?'SerpApi timeout after 45 seconds':`SerpApi network error: ${e.message}`);}
+ const raw=await r.text();let data={};
+ try{data=JSON.parse(raw)}catch{}
+ if(!r.ok || data.error){
+   const detail=String(data.error||data.message||`HTTP ${r.status}`).slice(0,250).replaceAll(SERPAPI_KEY,'[redacted]');
+   throw Error(`SerpApi HTTP ${r.status}: ${detail}`);
+ }
+ return data;
 }
 async function serpJobs(){
   const slot=Math.floor(Date.now()/(6*3600000))%SERP_QUERIES.length;
-  const data=await serpRequest({engine:'google_jobs',q:SERP_QUERIES[slot],location:'Israel',hl:'en',gl:'il'});
+  const data=await serpRequest({engine:'google_jobs',q:SERP_QUERIES[slot],hl:'en',gl:'il'});
   return (data.jobs_results||[]).map(x=>({
     id:`serpjob:${x.job_id||crypto.createHash('sha256').update(String(x.title)+String(x.company_name)+String(x.location)).digest('hex')}`,
     title:clean(x.title),company:clean(x.company_name),location:clean(x.location),
@@ -109,11 +123,11 @@ async function serpJobs(){
 }
 async function serpIndexed(){
   const slot=Math.floor(Date.now()/(12*3600000))%GOOGLE_SEARCH_QUERIES.length;
-  const data=await serpRequest({engine:'google',q:GOOGLE_SEARCH_QUERIES[slot],hl:'he',gl:'il',num:'20'});
+  const data=await serpRequest({engine:'google',q:GOOGLE_SEARCH_QUERIES[slot],hl:'he',gl:'il',num:'10'});
   return (data.organic_results||[]).filter(x=>/^https:\/\//.test(x.link||'')).map(x=>({
     id:`indexed:${crypto.createHash('sha256').update(x.link).digest('hex')}`,
     title:clean(x.title),company:clean(x.source||new URL(x.link).hostname),
-    location:'ישראל',description:clean(x.snippet),url:x.link,
+    location:clean(x.snippet),description:clean(x.snippet),url:x.link,
     source:'Google indexed listings',publishedAt:null
   }));
 }
