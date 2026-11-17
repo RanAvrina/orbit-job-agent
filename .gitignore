@@ -1,0 +1,6 @@
+data.json
+data.json.tmp
+.env
+.env.*
+!.env.example
+node_modules/

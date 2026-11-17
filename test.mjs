@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import {evaluate} from './server.mjs';
+const job=(title,location,description='')=>({title,location,description});
+assert.equal(evaluate(job('Junior PMO','Tel Aviv')).eligible,true);
+assert.equal(evaluate(job('Junior Project Coordinator','Beer Sheva')).eligible,true);
+assert.equal(evaluate(job('Senior Project Manager','Ramat Gan')).eligible,false);
+assert.equal(evaluate(job('Junior PMO','Berlin')).eligible,false);
+assert.equal(evaluate(job('Data Analyst','Remote - Israel')).eligible,true);
+assert.equal(evaluate(job('Account Executive','Tel Aviv')).eligible,false);
+console.log('6 checks passed');
