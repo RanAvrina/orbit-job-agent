@@ -48,6 +48,13 @@ input,select{padding:12px;border:1px solid #dce4ef;border-radius:10px;max-width:
 .login p{color:#758399;line-height:1.7}
 #loginError{color:#b42318;font-size:13px}
 .actions{display:flex;gap:10px;flex-wrap:wrap}
+.queue-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.queue-status{display:inline-block;border-radius:30px;background:#eef2f8;padding:6px 10px;font-size:12px;color:#304a6d}
+.queue-status.approved_for_testing{background:#e8f7ee;color:#166b43}
+.queue-status.rejected{background:#fff0ed;color:#9c2b24}
+.queue-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.queue-actions button{padding:9px 12px}
+.queue-note{background:#fff5e5;border-radius:12px;padding:12px 15px;color:#805312;margin:15px 0}
 @media(max-width:900px){
 aside{position:static;width:auto;padding:15px}
 .logo{margin:0 0 12px}
@@ -138,9 +145,15 @@ main{margin:0;padding:20px}
 <section id="applications" class="hidden">
 <div class="hero">
 <h2>מעקב מועמדויות</h2>
-<p>הגשה אוטומטית אינה פעילה כרגע.</p>
+<p>משרות בציון 65% ומעלה מוכנות לבדיקה. אין שליחה אמיתית למעסיקים.</p>
 </div>
-<div id="applicationList" class="panel"></div>
+<div class="panel">
+<div class="queue-note"><strong>מצב הדמיה בלבד:</strong> אישור מועמדות לא שולח אותה למעסיק.</div>
+<div class="queue-controls"><label for="queueFilter">סינון:</label><select id="queueFilter"><option value="">כל המועמדויות</option><option value="pending_review">ממתינות לאישור</option><option value="approved_for_testing">אושרו לבדיקה</option><option value="rejected">נדחו</option></select><button id="queueRefresh" class="secondary">רענון</button></div>
+<p id="queueSummary" class="muted"></p>
+<div id="queueList"></div>
+</div>
+<h2>מעקב ידני</h2><div id="applicationList" class="panel"></div>
 </section>
 
 <section id="settings" class="hidden">
@@ -152,7 +165,9 @@ main{margin:0;padding:20px}
 <p><strong>אזורי חיפוש:</strong> דרום, תל אביב, רמת גן</p>
 <p><strong>תחומים:</strong> מערכות מידע, ERP, CRM, BI, Data, AI, PMO וניהול פרויקטים</p>
 <p><strong>תדירות מתוכננת:</strong> כל 30 דקות</p>
-<p><strong>הגשה אוטומטית:</strong> כבויה</p>
+<p><strong>סף התאמה לתור:</strong> 65%</p>
+<p><strong>הכנת מועמדויות:</strong> אוטומטית במצב בדיקה</p>
+<p><strong>שליחה אמיתית:</strong> כבויה בקוד השרת</p>
 <p class="muted">שינוי ההגדרות כאן עדיין אינו נתמך.</p>
 </div>
 </section>
@@ -164,6 +179,7 @@ main{margin:0;padding:20px}
 let token = "";
 let jobs = [];
 let applications = [];
+let applicationQueue = [];
 let loading = false;
 
 const el = id => document.getElementById(id);
@@ -256,6 +272,17 @@ function renderJobs() {
     : "<p>לא נמצאו משרות מתאימות.</p>";
 }
 
+function renderQueue(){
+ const filter=el("queueFilter").value;
+ const shown=applicationQueue.filter(q=>!filter||q.status===filter);
+ el("queueSummary").textContent="בתור: "+applicationQueue.length+" | ממתינות: "+applicationQueue.filter(q=>q.status==="pending_review").length+" | אושרו לבדיקה: "+applicationQueue.filter(q=>q.status==="approved_for_testing").length;
+ const names={pending_review:"ממתינה לאישור",approved_for_testing:"אושרה לבדיקה בלבד",rejected:"נדחתה"};
+ el("queueList").innerHTML=shown.length?shown.map(q=>{
+  const job=jobs.find(j=>j.id===q.jobId);
+  const link=job?safeURL(job.url):"";
+  return '<article class="job"><h3>'+escapeHTML(q.title||job?.title||"משרה")+'</h3><p>'+escapeHTML(q.company||job?.company||"")+' · '+escapeHTML(q.source||"")+'</p><p><span class="score">התאמה: '+Number(q.score||0)+'%</span> · <span class="queue-status '+escapeHTML(q.status)+'">'+escapeHTML(names[q.status]||q.status)+'</span></p><p>'+escapeHTML(q.reason||"")+'</p>'+(link?'<a href="'+escapeHTML(link)+'" target="_blank" rel="noopener noreferrer">פתיחת המשרה</a>':"")+'<div class="queue-actions"><button class="primary" data-review="approved_for_testing" data-job="'+escapeHTML(q.jobId)+'">אשר לבדיקה</button><button class="secondary" data-review="rejected" data-job="'+escapeHTML(q.jobId)+'">דחה</button><button class="secondary" data-review="pending_review" data-job="'+escapeHTML(q.jobId)+'">החזר לממתינות</button></div></article>';
+ }).join(""):"<p>אין מועמדויות בסטטוס שנבחר.</p>";
+}
 function renderApplications() {
   el("applicationList").innerHTML = applications.length
     ? applications.map(a => `
@@ -273,18 +300,20 @@ async function refresh() {
   loading = true;
 
   try {
-    const [j, a, status] = await Promise.all([
+    const [j, a, status, queue] = await Promise.all([
       api("/api/jobs"),
       api("/api/applications"),
-      api("/api/status")
+      api("/api/status"),
+      api("/api/application-queue")
     ]);
 
-    if (!Array.isArray(j) || !Array.isArray(a)) {
+    if (!Array.isArray(j) || !Array.isArray(a) || !Array.isArray(queue)) {
       throw new Error("מבנה הנתונים שהשרת החזיר אינו תקין");
     }
 
     jobs = j;
     applications = a;
+    applicationQueue = queue;
 
     el("loginOverlay").classList.add("hidden");
     el("loginError").textContent = "";
@@ -310,6 +339,7 @@ async function refresh() {
 
     renderJobs();
     renderApplications();
+    renderQueue();
 
     el("footer").textContent =
       "Orbit · סריקה אחרונה: " +
@@ -349,6 +379,7 @@ el("logout").addEventListener("click", () => {
   token = "";
   jobs = [];
   applications = [];
+  applicationQueue = [];
   el("loginOverlay").classList.remove("hidden");
   el("badge").textContent = "ממתין לחיבור";
 });
@@ -407,6 +438,19 @@ document.querySelectorAll(".nav").forEach(button => {
   });
 });
 
+el("queueFilter").addEventListener("change",renderQueue);
+el("queueRefresh").addEventListener("click",refresh);
+el("queueList").addEventListener("click",async event=>{
+ const button=event.target.closest("button[data-review]");
+ if(!button||!token)return;
+ button.disabled=true;
+ try{
+  const result=await api("/api/application-queue/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jobId:button.dataset.job,status:button.dataset.review})});
+  if(result.submitted!==false)throw new Error("סטטוס שליחה לא צפוי");
+  await refresh();
+ }catch(error){alert("עדכון הסטטוס נכשל: "+error.message);}
+ finally{button.disabled=false;}
+});
 el("search").addEventListener("input", renderJobs);
 el("region").addEventListener("change", renderJobs);
 

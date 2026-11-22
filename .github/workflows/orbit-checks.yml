@@ -1,0 +1,23 @@
+name: Orbit safe checks
+on:
+  push:
+    branches: [main, feature/autoapply-dry-run-65]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check server syntax
+        run: node --check server.mjs
+      - name: Run unit tests
+        run: NODE_ENV=test node --test tests/*.test.mjs
+      - name: Verify live application submission remains disabled
+        run: grep -q 'const APPLY_ENABLED=false' server.mjs
